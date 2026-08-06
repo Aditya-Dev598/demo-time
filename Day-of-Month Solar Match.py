@@ -157,9 +157,12 @@ def compute_day_of_month_metrics(demand_path: str, supply_path: str, interval_se
     n_negative = (demand_long["Demand_kW"] < 0).sum()
     if n_negative:
         pct = n_negative / len(demand_long) * 100
-        print(f"Clipping {n_negative} negative demand samples ({pct:.2f}%) to 0 "
-              f"(export/regenerative power isn't demand solar can be used against)")
-        demand_long["Demand_kW"] = demand_long["Demand_kW"].clip(lower=0)
+        print(f"Clipping {n_negative} negative demand samples ({pct:.2f}%) to 0 for the "
+              f"min(demand, supply) calc -- tracked separately below as Regenerative Export.")
+    # Magnitude of negative (regenerative/export) demand, captured before clipping so it
+    # isn't just discarded -- it competes with unused solar for the same grid connection.
+    demand_long["Regen_kW"] = (-demand_long["Demand_kW"]).clip(lower=0)
+    demand_long["Demand_kW"] = demand_long["Demand_kW"].clip(lower=0)
 
     print(f"Supply: {supply_long['Year'].nunique()} year(s) -- {sorted(supply_long['Year'].unique())}")
 
@@ -168,7 +171,7 @@ def compute_day_of_month_metrics(demand_path: str, supply_path: str, interval_se
     # month/year. Inner join so hours absent from demand are dropped rather
     # than raising or being treated as zero demand.
     merged = supply_long.merge(
-        demand_long[["DayOfMonth", "Hour", "Day_Type", "Demand_kW"]],
+        demand_long[["DayOfMonth", "Hour", "Day_Type", "Demand_kW", "Regen_kW"]],
         on=["DayOfMonth", "Hour"],
         how="inner",
     )
@@ -176,12 +179,14 @@ def compute_day_of_month_metrics(demand_path: str, supply_path: str, interval_se
     interval_h = interval_seconds / 3600.0
     merged["Demand_kWh"] = merged["Demand_kW"] * interval_h
     merged["Used_kWh"] = np.minimum(merged["Demand_kW"], merged["Supply_kWh"]) * interval_h
+    merged["Regen_kWh"] = merged["Regen_kW"] * interval_h
 
     hourly = merged.groupby(["Date_dt", "Hour"], as_index=False).agg(
         Season=("Season", "first"),
         Demand_kWh=("Demand_kWh", "sum"),
         Used_kWh=("Used_kWh", "sum"),
         Supply_kWh=("Supply_kWh", "first"),
+        Regen_kWh=("Regen_kWh", "sum"),
         Samples=("Demand_kWh", "size"),
     )
 
@@ -191,7 +196,11 @@ def compute_day_of_month_metrics(demand_path: str, supply_path: str, interval_se
         demand_total = sub["Demand_kWh"].sum()
         supply_total = sub["Supply_kWh"].sum()
         used_total = sub["Used_kWh"].sum()
+        regen_total = sub["Regen_kWh"].sum()
         spill = supply_total - used_total
+        # Unused solar and regenerative braking both push power upstream through the
+        # same grid connection, so they're additive for an export/curtailment view.
+        total_grid_export = spill + regen_total
 
         summary_rows.append({
             "Period": period,
@@ -199,7 +208,9 @@ def compute_day_of_month_metrics(demand_path: str, supply_path: str, interval_se
             "Total Demand (GWh)": kwh_to_gwh(demand_total),
             "Total PV Supply (GWh)": kwh_to_gwh(supply_total),
             "Used Solar (GWh)": kwh_to_gwh(used_total),
-            "Spillage (GWh)": kwh_to_gwh(spill),
+            "Solar Spillage (GWh)": kwh_to_gwh(spill),
+            "Regenerative Export (GWh)": kwh_to_gwh(regen_total),
+            "Total Grid Export (GWh)": kwh_to_gwh(total_grid_export),
             "Solar Share (%)": round(used_total / demand_total * 100, 3) if demand_total > 0 else 0.0,
             "Utilisation (%)": round(used_total / supply_total * 100, 3) if supply_total > 0 else 0.0,
         })
