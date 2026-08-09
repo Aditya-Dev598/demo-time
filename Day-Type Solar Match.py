@@ -8,10 +8,19 @@ import pandas as pd
 # SET INPUT / OUTPUT HERE
 # -------------------------
 demand_path = r"C:\Users\user\Downloads\data json.json"                # .json, .csv, or .xlsx/.xls -- see read_demand()
-supply_path = r"C:\Users\user\Downloads\supply data.xlsx"              # HOURLY supply, WIDE (Date | Total Units | 00:00..23:00)
 output_path = r"C:\Users\user\Downloads\day_type_solar_summary.xlsx"
 
 INTERVAL_SECONDS = 2  # sampling interval of the demand data
+
+# Each entry is matched against the SAME demand profile independently, for
+# side-by-side comparison. "year" is only needed for supply files with no
+# year in their dates (e.g. 'Start Date' half-hourly tables like DD-MM);
+# omit/None for files that already carry real dates (e.g. supply data.xlsx).
+SUPPLY_SCENARIOS = [
+    {"name": "IP4", "path": r"C:\Users\user\Downloads\ip4.csv", "year": 2026},
+    {"name": "IP6", "path": r"C:\Users\user\Downloads\IP6.csv", "year": 2026},
+    {"name": "IP8", "path": r"C:\Users\user\Downloads\IP8.csv", "year": 2026},
+]
 
 # Day-type definition used for BOTH the demand sample month and the supply
 # year(s) -- overrides any Day_Type label baked into the demand file, since
@@ -157,6 +166,67 @@ def read_supply_long(path: str) -> pd.DataFrame:
     return long
 
 
+def read_supply_halfhourly_ddmm(path: str, year: int) -> pd.DataFrame:
+    """
+    Reads a WIDE half-hourly supply table with no year in its dates:
+      Start Date | 00:00:00 | 00:30:00 | ... | 23:30:00
+    Dates are 'DD-MM' (day-first -- confirmed by '31-12' as the last day of
+    the year) and get anchored to `year`. Non-date footer rows (e.g. a
+    trailing 'Total Result' summary row) and blank trailing columns are
+    dropped. Half-hour columns are summed in pairs into hourly buckets to
+    match the rest of the pipeline's hourly supply format.
+    """
+    df = pd.read_csv(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
+
+    date_col = "Start Date"
+    if date_col not in df.columns:
+        raise ValueError(f"Expected a '{date_col}' column in {path}, found: {df.columns.tolist()}")
+
+    valid = df[date_col].astype(str).str.match(r"^\d{1,2}-\d{1,2}$")
+    if (~valid).any():
+        print(f"Dropping {(~valid).sum()} non-date row(s) from {path}: "
+              f"{df.loc[~valid, date_col].tolist()}")
+    df = df[valid].copy()
+
+    df["Date_dt"] = pd.to_datetime(df[date_col] + f"-{year}", format="%d-%m-%Y", errors="coerce")
+    if df["Date_dt"].isna().any():
+        raise ValueError(f"Could not parse some dates in {path} with year {year}.")
+
+    half_hour_cols = [c for c in df.columns if c not in (date_col, "Date_dt")]
+    for c in half_hour_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    hourly = pd.DataFrame({"Date_dt": df["Date_dt"]})
+    for h in range(24):
+        t00, t30 = f"{h:02d}:00:00", f"{h:02d}:30:00"
+        v00 = df[t00] if t00 in df.columns else 0
+        v30 = df[t30] if t30 in df.columns else 0
+        hourly[f"{h:02d}:00"] = v00 + v30
+
+    hour_cols = [f"{h:02d}:00" for h in range(24)]
+    long = hourly.melt(id_vars=["Date_dt"], value_vars=hour_cols, var_name="Hour", value_name="Supply_kWh")
+    long["DayType"] = long["Date_dt"].dt.dayofweek.map(day_type_of)
+    long["Season"] = long["Date_dt"].dt.month.apply(season_from_month)
+    long["Year"] = long["Date_dt"].dt.year
+
+    return long
+
+
+def load_supply_long(path: str, year: int | None = None) -> pd.DataFrame:
+    """Dispatches to the right supply loader based on the file's own column layout."""
+    ext = Path(path).suffix.lower()
+    if ext == ".csv":
+        header = pd.read_csv(path, nrows=0).columns
+        header = [str(c).strip() for c in header]
+        if "Start Date" in header:
+            if year is None:
+                raise ValueError(f"{path} has no year in its dates -- pass a reference year.")
+            return read_supply_halfhourly_ddmm(path, year)
+    return read_supply_long(path)
+
+
 # -------------------------
 # HELPERS
 # -------------------------
@@ -175,9 +245,8 @@ def kwh_to_gwh(v: float) -> float:
 # -------------------------
 # MAIN
 # -------------------------
-def compute_day_type_metrics(demand_path: str, supply_path: str, interval_seconds: int):
+def build_demand_profile(demand_path: str) -> pd.DataFrame:
     demand_long = read_demand(demand_path)
-    supply_long = read_supply_long(supply_path)
 
     hours_span = sorted(demand_long["Hour"].unique())
     print(f"Demand: hours {hours_span[0]}-{hours_span[-1]} ({len(hours_span)} of 24 hourly buckets present)")
@@ -198,6 +267,10 @@ def compute_day_type_metrics(demand_path: str, supply_path: str, interval_second
     profile["Regen_kW"] = (-profile["Demand_kW"]).clip(lower=0)
     profile["Demand_kW"] = profile["Demand_kW"].clip(lower=0)
 
+    return profile
+
+
+def compute_metrics_from_profile(profile: pd.DataFrame, supply_long: pd.DataFrame, interval_seconds: int):
     print(f"Supply: {supply_long['Year'].nunique()} year(s) -- {sorted(supply_long['Year'].unique())}")
 
     # Day-type match: every real (Date, Hour) in supply picks up the
@@ -261,22 +334,32 @@ def build_summary(hourly: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 # RUN
 # -------------------------
-summary, hourly_detail = compute_day_type_metrics(demand_path, supply_path, INTERVAL_SECONDS)
+profile = build_demand_profile(demand_path)
 
-year_summaries = {
-    year: build_summary(hourly_detail[hourly_detail["Year"] == year])
-    for year in sorted(hourly_detail["Year"].unique())
-}
+results = {}
+for scenario in SUPPLY_SCENARIOS:
+    print(f"\n--- Scenario: {scenario['name']} ({scenario['path']}) ---")
+    supply_long = load_supply_long(scenario["path"], scenario.get("year"))
+    summary, hourly_detail = compute_metrics_from_profile(profile, supply_long, INTERVAL_SECONDS)
+    results[scenario["name"]] = {"summary": summary, "hourly": hourly_detail}
+
+# Side-by-side Annual comparison across scenarios, for the quick read.
+comparison = pd.concat(
+    [res["summary"][res["summary"]["Period"] == "Annual"].assign(Scenario=name)
+     for name, res in results.items()],
+    ignore_index=True,
+)
+comparison = comparison[["Scenario"] + [c for c in comparison.columns if c != "Scenario"]]
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-    summary.to_excel(writer, sheet_name="Summary (all years)", index=False)
-    for year, ys in year_summaries.items():
-        ys.to_excel(writer, sheet_name=f"Summary {year}", index=False)
-    hourly_detail.to_excel(writer, sheet_name="Hourly Detail", index=False)
+    comparison.to_excel(writer, sheet_name="Comparison (Annual)", index=False)
+    for name, res in results.items():
+        res["summary"].to_excel(writer, sheet_name=f"Summary {name}", index=False)
+        res["hourly"].to_excel(writer, sheet_name=f"Hourly {name}", index=False)
 
 print("\nSaved:", output_path)
-print("\n=== All years combined ===")
-print(summary.to_string(index=False))
-for year, ys in year_summaries.items():
-    print(f"\n=== {year} only ===")
-    print(ys.to_string(index=False))
+print("\n=== Annual comparison across scenarios ===")
+print(comparison.to_string(index=False))
+for name, res in results.items():
+    print(f"\n=== {name}: full seasonal breakdown ===")
+    print(res["summary"].to_string(index=False))
