@@ -198,12 +198,16 @@ def read_supply_halfhourly_ddmm(path: str, year: int) -> pd.DataFrame:
     for c in half_hour_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+    # Values are POWER (kW), not energy -- a half-hour sample's energy is
+    # kW * 0.5h, so the hourly bucket is the AVERAGE of the two half-hour
+    # readings (numerically equal to that hour's energy in kWh, since the
+    # bucket duration is 1h), not their sum.
     hourly = pd.DataFrame({"Date_dt": df["Date_dt"]})
     for h in range(24):
         t00, t30 = f"{h:02d}:00:00", f"{h:02d}:30:00"
         v00 = df[t00] if t00 in df.columns else 0
         v30 = df[t30] if t30 in df.columns else 0
-        hourly[f"{h:02d}:00"] = v00 + v30
+        hourly[f"{h:02d}:00"] = (v00 + v30) / 2
 
     hour_cols = [f"{h:02d}:00" for h in range(24)]
     long = hourly.melt(id_vars=["Date_dt"], value_vars=hour_cols, var_name="Hour", value_name="Supply_kWh")
