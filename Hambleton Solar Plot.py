@@ -8,11 +8,11 @@ import pandas as pd
 # -------------------------
 # SET INPUT / OUTPUT HERE
 # -------------------------
-demand_path = r"C:\Users\user\Downloads\Hambleton_Jn_N_T1_January_2026_2sec.json"
+demand_path = r"C:\Users\user\Downloads\Hambleton Jn Demand 2.json"
 
 # Single scenario -- no comparison across capacities.
-SCENARIO_NAME = "2100kWp"
-SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton6.csv"
+SCENARIO_NAME = "2700kWp"
+SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton Supply 2.csv"
 SUPPLY_YEAR = 2005  # only used to weight the Weekday/Weekend demand blend by real day-of-week counts
 
 output_avg_png = r"C:\Users\user\Downloads\hambleton_avg_24h_profile.png"
@@ -26,6 +26,14 @@ WEEKDAY_DAYS_OF_WEEK = {0, 1, 2, 3, 4, 5}
 
 def day_type_of(dow: int) -> str:
     return "Weekday" if dow in WEEKDAY_DAYS_OF_WEEK else "Weekend"
+
+
+def get_demand_site_name(path: str) -> str:
+    """Reads the 'site' field from the demand file's metadata, so chart
+    titles reflect whichever demand file is actually loaded."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return raw.get("metadata", {}).get("site") or Path(path).stem
 
 
 def season_from_month(m: int) -> str:
@@ -124,6 +132,7 @@ def read_supply_pvgis_raw(path: str) -> pd.DataFrame:
 # -------------------------
 # BUILD CURVES
 # -------------------------
+site_name = get_demand_site_name(demand_path)
 weekday_demand, weekend_demand = build_hourly_demand_curves(demand_path)
 blended_demand = blend_by_daycount(weekday_demand, weekend_demand, SUPPLY_YEAR)
 
@@ -157,7 +166,7 @@ fig, ax = plt.subplots(figsize=(9, 6))
 ax.plot(x, blended_demand, label="Demand (annual avg)", color=COLOR_BLENDED, linewidth=2.2)
 ax.plot(x, avg_supply, label="Supply", color=COLOR_SUPPLY, linewidth=2.2)
 ax.fill_between(x, avg_used, color=COLOR_USED, alpha=0.7, label="Used Solar")
-ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Average 24h Profile")
+ax.set_title(f"{site_name} {SCENARIO_NAME}: Average 24h Profile")
 style_axes(ax)
 ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=9)
 plt.tight_layout()
@@ -174,7 +183,7 @@ ax.plot(x, weekday_demand, color=COLOR_WEEKDAY, linewidth=2.2, label="Weekday De
 ax.plot(x, weekend_demand, color=COLOR_WEEKEND, linewidth=2.2, label="Weekend Demand (Sun)")
 ax.plot(x, blended_demand, color=COLOR_BLENDED, linestyle="--", linewidth=1.8, label="Blended Avg Demand")
 ax.plot(x, avg_supply, color=COLOR_SUPPLY, linestyle="--", linewidth=1.8, label="Avg Supply")
-ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Weekday vs Weekend Demand")
+ax.set_title(f"{site_name} {SCENARIO_NAME}: Weekday vs Weekend Demand")
 style_axes(ax)
 ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=9)
 plt.tight_layout()
@@ -192,7 +201,7 @@ ax.plot(x, blended_demand, color=COLOR_BLENDED, linewidth=2.2,
 ax.plot(x, seasonal_supply["DJF"], color=COLOR_DJF, linewidth=2.0, label="Winter Supply (DJF)")
 ax.plot(x, seasonal_supply["JJA"], color=COLOR_JJA, linewidth=2.0, label="Summer Supply (JJA)")
 ax.plot(x, seasonal_supply["SHOULDER"], color=COLOR_SHOULDER, linewidth=2.0, label="Shoulder Supply")
-ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Seasonal Supply vs Demand")
+ax.set_title(f"{site_name} {SCENARIO_NAME}: Seasonal Supply vs Demand")
 style_axes(ax)
 ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=9)
 plt.tight_layout()
