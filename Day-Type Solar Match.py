@@ -22,6 +22,14 @@ SUPPLY_SCENARIOS = [
     {"name": "IP8", "path": r"C:\Users\user\Downloads\IP8.csv", "year": 2026},
 ]
 
+# A separate site: its own demand sample matched against its own dedicated
+# supply file (raw PVGIS export), not part of the SUPPLY_SCENARIOS comparison
+# above -- that loop compares PV sizes against ONE demand profile, whereas
+# this is a different demand profile entirely.
+HAMBLETON_DEMAND_PATH = r"C:\Users\user\Downloads\Hambleton_Jn_N_T1_January_2026_2sec.json"
+HAMBLETON_SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton.csv"
+HAMBLETON_OUTPUT_PATH = r"C:\Users\user\Downloads\hambleton_solar_summary.xlsx"
+
 # Day-type definition used for BOTH the demand sample month and the supply
 # year(s) -- overrides any Day_Type label baked into the demand file, since
 # that label may use a different convention (e.g. Mon-Fri/Sat-Sun).
@@ -320,6 +328,56 @@ def load_supply_long(path: str, year: int | None = None) -> pd.DataFrame:
     return read_supply_long(path)
 
 
+def read_supply_pvgis_raw(path: str) -> pd.DataFrame:
+    """
+    Reads a raw PVGIS hourly export: a handful of metadata header lines
+    (latitude, slope, nominal kWp, etc.), then a table starting with
+    'time,P,G(i),H_sun,T2m,WS10m,Int'. Timestamps are 'YYYYMMDD:HHMM' (PVGIS
+    offsets these to HH:30, one reading per real hour) and 'P' is power in
+    Watts. A trailing blank line + copyright footer follows the data table.
+
+    Converts P (W) to kW -- numerically equal to that hour's energy in kWh,
+    since PVGIS already gives one reading per hour (same convention already
+    used for supply data.xlsx, which was itself originally produced this way).
+    """
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    header_idx = next(
+        (i for i, line in enumerate(lines) if line.strip().lower().startswith("time,")), None
+    )
+    if header_idx is None:
+        raise ValueError(f"Could not find PVGIS table header (a line starting with 'time,') in {path}.")
+
+    df = pd.read_csv(path, skiprows=header_idx)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "time" not in df.columns or "P" not in df.columns:
+        raise ValueError(f"Expected 'time' and 'P' columns in {path}. Found: {df.columns.tolist()}")
+
+    # Drop the footer (blank line + copyright notice) by keeping only rows
+    # whose 'time' actually matches PVGIS's YYYYMMDD:HHMM format.
+    valid = df["time"].astype(str).str.match(r"^\d{8}:\d{4}$")
+    if (~valid).any():
+        print(f"Dropping {(~valid).sum()} non-data row(s) from {path} (PVGIS footer/blank lines).")
+    df = df[valid].copy()
+
+    dt = pd.to_datetime(df["time"], format="%Y%m%d:%H%M", errors="coerce")
+    if dt.isna().any():
+        raise ValueError(f"Failed to parse some PVGIS timestamps in {path} with format %Y%m%d:%H%M.")
+
+    long = pd.DataFrame({
+        "Date_dt": dt.dt.normalize(),
+        "Hour": dt.dt.floor("h").dt.strftime("%H:00"),
+        "Supply_kWh": pd.to_numeric(df["P"], errors="coerce").fillna(0) / 1000.0,
+    })
+    long["DayType"] = long["Date_dt"].dt.dayofweek.map(day_type_of)
+    long["Season"] = long["Date_dt"].dt.month.apply(season_from_month)
+    long["Year"] = long["Date_dt"].dt.year
+
+    return long
+
+
 # -------------------------
 # HELPERS
 # -------------------------
@@ -456,3 +514,23 @@ print(comparison.to_string(index=False))
 for name, res in results.items():
     print(f"\n=== {name}: full seasonal breakdown ===")
     print(res["summary"].to_string(index=False))
+
+
+# -------------------------
+# HAMBLETON JN N (T1) -- a separate site: its own demand matched to its own
+# dedicated PVGIS supply file, not part of the SUPPLY_SCENARIOS comparison.
+# -------------------------
+print("\n--- Site: Hambleton Jn N (T1) ---")
+hambleton_profile = build_demand_profile(HAMBLETON_DEMAND_PATH)
+hambleton_supply_long = read_supply_pvgis_raw(HAMBLETON_SUPPLY_PATH)
+hambleton_summary, hambleton_hourly = compute_metrics_from_profile(
+    hambleton_profile, hambleton_supply_long, INTERVAL_SECONDS
+)
+
+with pd.ExcelWriter(HAMBLETON_OUTPUT_PATH, engine="openpyxl") as writer:
+    hambleton_summary.to_excel(writer, sheet_name="Summary", index=False)
+    hambleton_hourly.to_excel(writer, sheet_name="Hourly Detail", index=False)
+
+print("\nSaved:", HAMBLETON_OUTPUT_PATH)
+print("\n=== Hambleton Jn N (T1): full seasonal breakdown ===")
+print(hambleton_summary.to_string(index=False))
