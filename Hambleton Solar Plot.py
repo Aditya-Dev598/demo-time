@@ -10,15 +10,10 @@ import pandas as pd
 # -------------------------
 demand_path = r"C:\Users\user\Downloads\Hambleton_Jn_N_T1_January_2026_2sec.json"
 
-# Representative spread of the PV sizes explored so far: the original tiny
-# system, the closest match found to Potteric Carr's IP8 scenario, and the
-# largest tested. "year" is only used to weight the Weekday/Weekend demand
-# blend by real day-of-week counts -- all three PVGIS exports use 2005.
-SUPPLY_SCENARIOS = [
-    {"name": "4kWp", "path": r"C:\Users\user\Downloads\Hambleton.csv", "year": 2005},
-    {"name": "2300kWp", "path": r"C:\Users\user\Downloads\Hambleton4.csv", "year": 2005},
-    {"name": "3000kWp", "path": r"C:\Users\user\Downloads\Hambleton2.csv", "year": 2005},
-]
+# Single scenario -- no comparison across capacities.
+SCENARIO_NAME = "2100kWp"
+SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton6.csv"
+SUPPLY_YEAR = 2005  # only used to weight the Weekday/Weekend demand blend by real day-of-week counts
 
 output_avg_png = r"C:\Users\user\Downloads\hambleton_avg_24h_profile.png"
 output_daytype_png = r"C:\Users\user\Downloads\hambleton_daytype_profile.png"
@@ -99,7 +94,7 @@ def blend_by_daycount(weekday_curve, weekend_curve, year: int):
 
 
 # -------------------------
-# SUPPLY: raw PVGIS hourly export -> long table per scenario
+# SUPPLY: raw PVGIS hourly export -> long table
 # -------------------------
 def read_supply_pvgis_raw(path: str) -> pd.DataFrame:
     """
@@ -127,30 +122,20 @@ def read_supply_pvgis_raw(path: str) -> pd.DataFrame:
 
 
 # -------------------------
-# BUILD CURVES FOR EVERY SCENARIO
+# BUILD CURVES
 # -------------------------
 weekday_demand, weekend_demand = build_hourly_demand_curves(demand_path)
+blended_demand = blend_by_daycount(weekday_demand, weekend_demand, SUPPLY_YEAR)
 
-scenario_data = {}
-for scenario in SUPPLY_SCENARIOS:
-    supply_long = read_supply_pvgis_raw(scenario["path"])
-    blended_demand = blend_by_daycount(weekday_demand, weekend_demand, scenario["year"])
+supply_long = read_supply_pvgis_raw(SUPPLY_PATH)
+avg_supply = supply_long.groupby("Hour")["Supply_kWh"].mean().reindex(HOUR_COLS).to_numpy()
+avg_used = np.minimum(blended_demand, avg_supply)
 
-    avg_supply = supply_long.groupby("Hour")["Supply_kWh"].mean().reindex(HOUR_COLS).to_numpy()
-    avg_used = np.minimum(blended_demand, avg_supply)
-
-    seasonal_supply = {
-        season: supply_long[supply_long["Season"] == season].groupby("Hour")["Supply_kWh"]
-        .mean().reindex(HOUR_COLS).to_numpy()
-        for season in ["DJF", "JJA", "SHOULDER"]
-    }
-
-    scenario_data[scenario["name"]] = {
-        "blended_demand": blended_demand,
-        "avg_supply": avg_supply,
-        "avg_used": avg_used,
-        "seasonal_supply": seasonal_supply,
-    }
+seasonal_supply = {
+    season: supply_long[supply_long["Season"] == season].groupby("Hour")["Supply_kWh"]
+    .mean().reindex(HOUR_COLS).to_numpy()
+    for season in ["DJF", "JJA", "SHOULDER"]
+}
 
 x = list(range(24))
 
@@ -159,62 +144,59 @@ def style_axes(ax):
     ax.set_xlabel("Hour")
     ax.set_ylabel("kWh / hour")
     ax.set_xticks(x)
-    ax.set_xticklabels(HOUR_COLS, rotation=45, ha="right", fontsize=7)
+    ax.set_xticklabels(HOUR_COLS, rotation=45, ha="right", fontsize=8)
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
 
 # -------------------------
-# PLOT 1: Average 24h profile, one subplot per scenario
+# PLOT 1: Average 24h profile
 # -------------------------
-fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True)
-for ax, (name, d) in zip(axes, scenario_data.items()):
-    ax.plot(x, d["blended_demand"], label="Demand (annual avg)", color=COLOR_BLENDED, linewidth=2.2)
-    ax.plot(x, d["avg_supply"], label="Supply", color=COLOR_SUPPLY, linewidth=2.2)
-    ax.fill_between(x, d["avg_used"], color=COLOR_USED, alpha=0.7, label="Used Solar")
-    ax.set_title(f"Hambleton {name}: Average 24h Profile")
-    style_axes(ax)
-axes[0].legend(loc="upper left", fontsize=8)
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.plot(x, blended_demand, label="Demand (annual avg)", color=COLOR_BLENDED, linewidth=2.2)
+ax.plot(x, avg_supply, label="Supply", color=COLOR_SUPPLY, linewidth=2.2)
+ax.fill_between(x, avg_used, color=COLOR_USED, alpha=0.7, label="Used Solar")
+ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Average 24h Profile")
+style_axes(ax)
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=9)
 plt.tight_layout()
-plt.savefig(output_avg_png, dpi=200)
+plt.savefig(output_avg_png, dpi=200, bbox_inches="tight")
 plt.close()
 
 
 # -------------------------
-# PLOT 2: Weekday vs Weekend demand, with each scenario's supply overlaid
+# PLOT 2: Weekday vs Weekend demand, with supply overlaid
 # -------------------------
-fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True)
-for ax, (name, d) in zip(axes, scenario_data.items()):
-    ax.fill_between(x, d["avg_used"], color=COLOR_USED, alpha=0.7, label="Avg Used Solar")
-    ax.plot(x, weekday_demand, color=COLOR_WEEKDAY, linewidth=2.2, label="Weekday Demand (Mon-Sat)")
-    ax.plot(x, weekend_demand, color=COLOR_WEEKEND, linewidth=2.2, label="Weekend Demand (Sun)")
-    ax.plot(x, d["blended_demand"], color=COLOR_BLENDED, linestyle="--", linewidth=1.8, label="Blended Avg Demand")
-    ax.plot(x, d["avg_supply"], color=COLOR_SUPPLY, linestyle="--", linewidth=1.8, label="Avg Supply")
-    ax.set_title(f"Hambleton {name}: Weekday vs Weekend Demand")
-    style_axes(ax)
-axes[0].legend(loc="upper left", fontsize=7)
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.fill_between(x, avg_used, color=COLOR_USED, alpha=0.7, label="Avg Used Solar")
+ax.plot(x, weekday_demand, color=COLOR_WEEKDAY, linewidth=2.2, label="Weekday Demand (Mon-Sat)")
+ax.plot(x, weekend_demand, color=COLOR_WEEKEND, linewidth=2.2, label="Weekend Demand (Sun)")
+ax.plot(x, blended_demand, color=COLOR_BLENDED, linestyle="--", linewidth=1.8, label="Blended Avg Demand")
+ax.plot(x, avg_supply, color=COLOR_SUPPLY, linestyle="--", linewidth=1.8, label="Avg Supply")
+ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Weekday vs Weekend Demand")
+style_axes(ax)
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=9)
 plt.tight_layout()
-plt.savefig(output_daytype_png, dpi=200)
+plt.savefig(output_daytype_png, dpi=200, bbox_inches="tight")
 plt.close()
 
 
 # -------------------------
 # PLOT 3: Seasonal supply vs (season-invariant) demand
 # -------------------------
-fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True)
-for ax, (name, d) in zip(axes, scenario_data.items()):
-    ax.fill_between(x, d["avg_used"], color=COLOR_USED, alpha=0.7, label="Avg Used Solar")
-    ax.plot(x, d["blended_demand"], color=COLOR_BLENDED, linewidth=2.2,
-            label="Demand (same all year -- single January sample month)")
-    ax.plot(x, d["seasonal_supply"]["DJF"], color=COLOR_DJF, linewidth=2.0, label="Winter Supply (DJF)")
-    ax.plot(x, d["seasonal_supply"]["JJA"], color=COLOR_JJA, linewidth=2.0, label="Summer Supply (JJA)")
-    ax.plot(x, d["seasonal_supply"]["SHOULDER"], color=COLOR_SHOULDER, linewidth=2.0, label="Shoulder Supply")
-    ax.set_title(f"Hambleton {name}: Seasonal Supply vs Demand")
-    style_axes(ax)
-axes[0].legend(loc="upper left", fontsize=7)
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.fill_between(x, avg_used, color=COLOR_USED, alpha=0.7, label="Avg Used Solar")
+ax.plot(x, blended_demand, color=COLOR_BLENDED, linewidth=2.2,
+        label="Demand (same all year -- single January sample month)")
+ax.plot(x, seasonal_supply["DJF"], color=COLOR_DJF, linewidth=2.0, label="Winter Supply (DJF)")
+ax.plot(x, seasonal_supply["JJA"], color=COLOR_JJA, linewidth=2.0, label="Summer Supply (JJA)")
+ax.plot(x, seasonal_supply["SHOULDER"], color=COLOR_SHOULDER, linewidth=2.0, label="Shoulder Supply")
+ax.set_title(f"Hambleton Jn N (T1) {SCENARIO_NAME}: Seasonal Supply vs Demand")
+style_axes(ax)
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=9)
 plt.tight_layout()
-plt.savefig(output_season_png, dpi=200)
+plt.savefig(output_season_png, dpi=200, bbox_inches="tight")
 plt.close()
 
 
@@ -222,18 +204,17 @@ plt.close()
 # SAVE UNDERLYING DATA
 # -------------------------
 with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
-    pd.DataFrame({"Hour": HOUR_COLS, "Weekday Demand": weekday_demand, "Weekend Demand": weekend_demand}) \
-        .to_excel(writer, sheet_name="Demand Profiles", index=False)
-    for name, d in scenario_data.items():
-        pd.DataFrame({
-            "Hour": HOUR_COLS,
-            "Blended Demand": d["blended_demand"],
-            "Avg Supply": d["avg_supply"],
-            "Avg Used Solar": d["avg_used"],
-            "DJF Supply": d["seasonal_supply"]["DJF"],
-            "JJA Supply": d["seasonal_supply"]["JJA"],
-            "Shoulder Supply": d["seasonal_supply"]["SHOULDER"],
-        }).to_excel(writer, sheet_name=name, index=False)
+    pd.DataFrame({
+        "Hour": HOUR_COLS,
+        "Weekday Demand": weekday_demand,
+        "Weekend Demand": weekend_demand,
+        "Blended Demand": blended_demand,
+        "Avg Supply": avg_supply,
+        "Avg Used Solar": avg_used,
+        "DJF Supply": seasonal_supply["DJF"],
+        "JJA Supply": seasonal_supply["JJA"],
+        "Shoulder Supply": seasonal_supply["SHOULDER"],
+    }).to_excel(writer, sheet_name=SCENARIO_NAME, index=False)
 
 print("Saved:", output_avg_png)
 print("Saved:", output_daytype_png)
