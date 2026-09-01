@@ -26,8 +26,8 @@ SUPPLY_SCENARIOS = [
 # supply file (raw PVGIS export), not part of the SUPPLY_SCENARIOS comparison
 # above -- that loop compares PV sizes against ONE demand profile, whereas
 # this is a different demand profile entirely.
-HAMBLETON_DEMAND_PATH = r"C:\Users\user\Downloads\Hambleton_Jn_N_T1_January_2026_2sec.json"
-HAMBLETON_SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton.csv"
+HAMBLETON_DEMAND_PATH = r"C:\Users\user\Downloads\Hambleton Jn Demand 2.json"
+HAMBLETON_SUPPLY_PATH = r"C:\Users\user\Downloads\Hambleton Supply 2.csv"
 HAMBLETON_OUTPUT_PATH = r"C:\Users\user\Downloads\hambleton_solar_summary.xlsx"
 
 # Day-type definition used for BOTH the demand sample month and the supply
@@ -39,6 +39,20 @@ WEEKEND_DAYS_OF_WEEK = {6}                 # Sunday only
 
 def day_type_of(dow: int) -> str:
     return "Weekday" if dow in WEEKDAY_DAYS_OF_WEEK else "Weekend"
+
+
+def get_demand_site_name(path: str) -> str:
+    """Reads the 'site' field from a JSON demand file's metadata; falls back to
+    the filename for other formats, since only the JSON schema carries a site
+    name. Used so run labels/output reflect whichever demand file is actually
+    loaded, rather than a hardcoded site name."""
+    if Path(path).suffix.lower() == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        site = raw.get("metadata", {}).get("site")
+        if site:
+            return site
+    return Path(path).stem
 
 
 # -------------------------
@@ -517,10 +531,11 @@ for name, res in results.items():
 
 
 # -------------------------
-# HAMBLETON JN N (T1) -- a separate site: its own demand matched to its own
+# HAMBLETON SITE -- a separate site: its own demand matched to its own
 # dedicated PVGIS supply file, not part of the SUPPLY_SCENARIOS comparison.
 # -------------------------
-print("\n--- Site: Hambleton Jn N (T1) ---")
+hambleton_site_name = get_demand_site_name(HAMBLETON_DEMAND_PATH)
+print(f"\n--- Site: {hambleton_site_name} ---")
 hambleton_profile = build_demand_profile(HAMBLETON_DEMAND_PATH)
 hambleton_supply_long = read_supply_pvgis_raw(HAMBLETON_SUPPLY_PATH)
 hambleton_summary, hambleton_hourly = compute_metrics_from_profile(
@@ -532,5 +547,5 @@ with pd.ExcelWriter(HAMBLETON_OUTPUT_PATH, engine="openpyxl") as writer:
     hambleton_hourly.to_excel(writer, sheet_name="Hourly Detail", index=False)
 
 print("\nSaved:", HAMBLETON_OUTPUT_PATH)
-print("\n=== Hambleton Jn N (T1): full seasonal breakdown ===")
+print(f"\n=== {hambleton_site_name}: full seasonal breakdown ===")
 print(hambleton_summary.to_string(index=False))
