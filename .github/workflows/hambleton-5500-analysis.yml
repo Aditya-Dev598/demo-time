@@ -1,0 +1,204 @@
+name: Hambleton 5.5 MWp analysis
+
+on:
+  push:
+    branches:
+      - analysis/hambleton-5500
+
+permissions:
+  contents: read
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calculate T1 and T2 at 5.5 MWp
+        shell: bash
+        run: |
+          python - <<'PY'
+          import bisect
+          import csv
+          import json
+          import re
+          from collections import defaultdict
+          from datetime import date, datetime
+
+          INTERVAL_SECONDS = 2
+          SCALE = 5500.0 / 2700.0
+          SOLAR_FILE = "Hambleton 2700.csv"
+          SITES = {
+              "T1": "Hambleton Jn Demand.json",
+              "T2": "Hambleton Jn Demand 2.json",
+          }
+
+          def day_type(d):
+              return "Weekday" if d.weekday() <= 5 else "Weekend"
+
+          def season(month):
+              if month in (12, 1, 2):
+                  return "DJF"
+              if month in (6, 7, 8):
+                  return "JJA"
+              return "SHOULDER"
+
+          def load_profiles(path):
+              with open(path, "r", encoding="utf-8") as f:
+                  raw = json.load(f)
+              times = raw["times"]
+              n = len(times)
+              sums = {"Weekday": [0.0] * n, "Weekend": [0.0] * n}
+              counts = {"Weekday": 0, "Weekend": 0}
+              for entry in raw["dates"]:
+                  d = date.fromisoformat(entry["date"])
+                  typ = day_type(d)
+                  vals = entry["demand_kw"]
+                  if len(vals) != n:
+                      raise ValueError(f"{path}: length mismatch on {entry['date']}")
+                  counts[typ] += 1
+                  target = sums[typ]
+                  for i, v in enumerate(vals):
+                      target[i] += float(v)
+              raw_profile = {
+                  typ: [v / counts[typ] for v in sums[typ]]
+                  for typ in ("Weekday", "Weekend")
+              }
+              pos = {typ: [max(v, 0.0) for v in raw_profile[typ]] for typ in raw_profile}
+              regen = {typ: [max(-v, 0.0) for v in raw_profile[typ]] for typ in raw_profile}
+              hour_idx = [[i for i, t in enumerate(times) if int(t[:2]) == h] for h in range(24)]
+              meta = raw.get("metadata", {})
+              return times, pos, regen, hour_idx, counts, meta
+
+          def load_solar(path):
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  lines = f.readlines()
+              header_idx = next(i for i, line in enumerate(lines) if line.strip().lower().startswith("time,"))
+              reader = csv.DictReader(lines[header_idx:])
+              rows = []
+              for row in reader:
+                  t = str(row.get("time", ""))
+                  if not re.match(r"^\d{8}:\d{4}$", t):
+                      continue
+                  dt = datetime.strptime(t, "%Y%m%d:%H%M")
+                  supply_kw = float(row["P"] or 0.0) / 1000.0 * SCALE
+                  rows.append((dt.date(), dt.hour, supply_kw, season(dt.month)))
+              return rows
+
+          solar_rows = load_solar(SOLAR_FILE)
+          solar_years = sorted({d.year for d, _, _, _ in solar_rows})
+
+          result = {
+              "capacity_kwp": 5500.0,
+              "capacity_mwp": 5.5,
+              "solar_source": SOLAR_FILE,
+              "solar_source_capacity_kwp": 2700.0,
+              "solar_years": solar_years,
+              "sites": {},
+          }
+
+          for label, demand_file in SITES.items():
+              times, pos, regen, hour_idx, sample_counts, meta = load_profiles(demand_file)
+              interval_h = INTERVAL_SECONDS / 3600.0
+
+              demand_hour = {"Weekday": [], "Weekend": []}
+              regen_hour = {"Weekday": [], "Weekend": []}
+              sorted_hour = {"Weekday": [], "Weekend": []}
+              prefix_hour = {"Weekday": [], "Weekend": []}
+
+              for typ in ("Weekday", "Weekend"):
+                  for h in range(24):
+                      arr = [pos[typ][i] for i in hour_idx[h]]
+                      rarr = [regen[typ][i] for i in hour_idx[h]]
+                      demand_hour[typ].append(sum(arr) * interval_h)
+                      regen_hour[typ].append(sum(rarr) * interval_h)
+                      sarr = sorted(arr)
+                      pref = [0.0]
+                      running = 0.0
+                      for v in sarr:
+                          running += v
+                          pref.append(running)
+                      sorted_hour[typ].append(sarr)
+                      prefix_hour[typ].append(pref)
+
+              def used_for(typ, h, supply_kw):
+                  arr = sorted_hour[typ][h]
+                  pref = prefix_hour[typ][h]
+                  k = bisect.bisect_right(arr, supply_kw)
+                  clipped_sum = pref[k] + (len(arr) - k) * supply_kw
+                  return clipped_sum * interval_h
+
+              acc = {p: {k: 0.0 for k in ("demand", "supply", "used", "regen")} for p in ("DJF", "JJA", "SHOULDER", "Annual")}
+              hours_covered = {p: 0 for p in acc}
+
+              supply_by_hour = defaultdict(list)
+              supply_by_season_hour = defaultdict(list)
+
+              for d, h, supply_kw, seas in solar_rows:
+                  typ = day_type(d)
+                  dem = demand_hour[typ][h]
+                  reg = regen_hour[typ][h]
+                  used = used_for(typ, h, supply_kw)
+                  for p in (seas, "Annual"):
+                      acc[p]["demand"] += dem
+                      acc[p]["supply"] += supply_kw
+                      acc[p]["used"] += used
+                      acc[p]["regen"] += reg
+                      hours_covered[p] += 1
+                  supply_by_hour[h].append(supply_kw)
+                  supply_by_season_hour[(seas, h)].append(supply_kw)
+
+              summary = []
+              for p in ("DJF", "JJA", "SHOULDER", "Annual"):
+                  a = acc[p]
+                  spill = a["supply"] - a["used"]
+                  export = spill + a["regen"]
+                  summary.append({
+                      "Period": p,
+                      "Hours Covered": hours_covered[p],
+                      "Total Demand (GWh)": round(a["demand"] / 1_000_000.0, 3),
+                      "Total PV Supply (GWh)": round(a["supply"] / 1_000_000.0, 3),
+                      "Used Solar (GWh)": round(a["used"] / 1_000_000.0, 3),
+                      "Solar Spillage (GWh)": round(spill / 1_000_000.0, 3),
+                      "Regenerative Export (GWh)": round(a["regen"] / 1_000_000.0, 3),
+                      "Total Grid Export (GWh)": round(export / 1_000_000.0, 3),
+                      "Solar Share (%)": round(a["used"] / a["demand"] * 100.0, 3) if a["demand"] else 0.0,
+                      "Utilisation (%)": round(a["used"] / a["supply"] * 100.0, 3) if a["supply"] else 0.0,
+                  })
+
+              # Plot curves reproduce Hambleton Solar Plot.py conventions:
+              # clipped hourly demand; 2023 day-count blend; avg supply by hour;
+              # plotted "used solar" = min(blended hourly demand, avg supply).
+              dates = sorted({d for d, _, _, _ in solar_rows})
+              n_weekday = sum(day_type(d) == "Weekday" for d in dates)
+              n_weekend = len(dates) - n_weekday
+              blended = [
+                  (demand_hour["Weekday"][h] * n_weekday + demand_hour["Weekend"][h] * n_weekend) / len(dates)
+                  for h in range(24)
+              ]
+              avg_supply = [sum(supply_by_hour[h]) / len(supply_by_hour[h]) for h in range(24)]
+              avg_used_plot = [min(blended[h], avg_supply[h]) for h in range(24)]
+              seasonal_supply = {
+                  seas: [sum(supply_by_season_hour[(seas, h)]) / len(supply_by_season_hour[(seas, h)]) for h in range(24)]
+                  for seas in ("DJF", "JJA", "SHOULDER")
+              }
+
+              result["sites"][label] = {
+                  "demand_file": demand_file,
+                  "site_name": meta.get("site", label),
+                  "sample_day_counts": sample_counts,
+                  "summary": summary,
+                  "plot": {
+                      "hours": [f"{h:02d}:00" for h in range(24)],
+                      "weekday_demand": [round(v, 6) for v in demand_hour["Weekday"]],
+                      "weekend_demand": [round(v, 6) for v in demand_hour["Weekend"]],
+                      "blended_demand": [round(v, 6) for v in blended],
+                      "avg_supply": [round(v, 6) for v in avg_supply],
+                      "avg_used_plot": [round(v, 6) for v in avg_used_plot],
+                      "seasonal_supply": {k: [round(v, 6) for v in vals] for k, vals in seasonal_supply.items()},
+                  },
+              }
+
+          print("HAMBLETON_RESULT_JSON_BEGIN")
+          print(json.dumps(result, separators=(",", ":")))
+          print("HAMBLETON_RESULT_JSON_END")
+          PY
