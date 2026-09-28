@@ -1,0 +1,91 @@
+name: Hambleton 5 MWp PVGIS match
+on:
+  push:
+    branches: [analysis/hambleton-5000]
+permissions:
+  contents: read
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch supplied PVGIS-equivalent profile and calculate
+        shell: bash
+        run: |
+          curl -fsSL 'https://re.jrc.ec.europa.eu/api/v5_3/seriescalc?lat=53.777&lon=-1.173&startyear=2022&endyear=2023&pvcalculation=1&peakpower=5&loss=14&angle=35&aspect=0&outputformat=csv' -o solar.csv
+          python - <<'PY'
+          import csv, json, re, bisect
+          from datetime import date, datetime
+
+          INTERVAL_H = 2/3600
+          WEEKDAY = {0,1,2,3,4,5}
+          def daytype(d): return 'Weekday' if d.weekday() in WEEKDAY else 'Weekend'
+          def season(m): return 'DJF' if m in (12,1,2) else ('JJA' if m in (6,7,8) else 'SHOULDER')
+
+          def load_demand(path):
+              raw=json.load(open(path,encoding='utf-8'))
+              times=raw['times']; n=len(times)
+              sums={'Weekday':[0.0]*n,'Weekend':[0.0]*n}; counts={'Weekday':0,'Weekend':0}
+              for e in raw['dates']:
+                  typ=daytype(date.fromisoformat(e['date'])); counts[typ]+=1
+                  for i,v in enumerate(e['demand_kw']): sums[typ][i]+=float(v)
+              prof={typ:[v/counts[typ] for v in sums[typ]] for typ in sums}
+              pos={typ:[max(v,0.0) for v in prof[typ]] for typ in prof}
+              regen={typ:[max(-v,0.0) for v in prof[typ]] for typ in prof}
+              idx=[[i for i,t in enumerate(times) if int(t[:2])==h] for h in range(24)]
+              return raw.get('metadata',{}),pos,regen,idx
+
+          def load_solar(path):
+              lines=open(path,encoding='utf-8',errors='ignore').read().splitlines()
+              hi=next(i for i,l in enumerate(lines) if l.strip().lower().startswith('time,'))
+              out=[]
+              for r in csv.DictReader(lines[hi:]):
+                  t=str(r.get('time',''))
+                  if re.match(r'^2023\d{4}:\d{4}$',t):
+                      dt=datetime.strptime(t,'%Y%m%d:%H%M')
+                      out.append((dt.date(),dt.hour,float(r['P'])/1000.0))
+              if len(out)!=8760: raise RuntimeError(f'Expected 8760 2023 solar rows, got {len(out)}')
+              return out
+
+          solar=load_solar('solar.csv')
+          print('PV_2023_GWH',round(sum(x[2] for x in solar)/1e6,6))
+
+          for label,path in [('T1','Hambleton Jn Demand.json'),('T2','Hambleton Jn Demand 2.json')]:
+              meta,pos,regen,idx=load_demand(path)
+              demand_e={t:[] for t in pos}; regen_e={t:[] for t in pos}
+              sorted_vals={t:[] for t in pos}; prefixes={t:[] for t in pos}
+              for typ in pos:
+                  for h in range(24):
+                      a=[pos[typ][i] for i in idx[h]]
+                      r=[regen[typ][i] for i in idx[h]]
+                      demand_e[typ].append(sum(a)*INTERVAL_H)
+                      regen_e[typ].append(sum(r)*INTERVAL_H)
+                      s=sorted(a); p=[0.0]
+                      for v in s: p.append(p[-1]+v)
+                      sorted_vals[typ].append(s); prefixes[typ].append(p)
+              def used(typ,h,supply_kw):
+                  a=sorted_vals[typ][h]; p=prefixes[typ][h]
+                  k=bisect.bisect_right(a,supply_kw)
+                  return (p[k]+(len(a)-k)*supply_kw)*INTERVAL_H
+              acc={p:{k:0.0 for k in ('d','s','u','r')} for p in ('DJF','JJA','SHOULDER','Annual')}
+              for d,h,s in solar:
+                  typ=daytype(d); seas=season(d.month)
+                  vals={'d':demand_e[typ][h],'s':s,'u':used(typ,h,s),'r':regen_e[typ][h]}
+                  for period in (seas,'Annual'):
+                      for k,v in vals.items(): acc[period][k]+=v
+              result=[]
+              for period in ('DJF','JJA','SHOULDER','Annual'):
+                  a=acc[period]; spill=a['s']-a['u']; grid=spill+a['r']
+                  result.append({
+                    'Period':period,
+                    'Demand_GWh':round(a['d']/1e6,3),
+                    'PV_GWh':round(a['s']/1e6,3),
+                    'UsedSolar_GWh':round(a['u']/1e6,3),
+                    'Spillage_GWh':round(spill/1e6,3),
+                    'Regen_GWh':round(a['r']/1e6,3),
+                    'GridExport_GWh':round(grid/1e6,3),
+                    'SolarShare_pct':round(a['u']/a['d']*100,3),
+                    'Utilisation_pct':round(a['u']/a['s']*100,3)
+                  })
+              print('RESULT',label,meta.get('site',label),json.dumps(result,separators=(',',':')))
+          PY
